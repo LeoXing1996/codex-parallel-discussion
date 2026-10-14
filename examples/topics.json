@@ -1,0 +1,5 @@
+[
+  {"topic": "CLI surface", "message": "Discuss how to simplify a CLI with too many overlapping commands. Suggest three concrete improvements. Do not read or edit files."},
+  {"topic": "Runtime flow", "message": "Discuss how to simplify a runtime with too many lifecycle states. Suggest three concrete improvements. Do not read or edit files."},
+  {"topic": "Web data flow", "message": "Discuss how to simplify a web app with duplicated caches. Suggest three concrete improvements. Do not read or edit files."}
+]

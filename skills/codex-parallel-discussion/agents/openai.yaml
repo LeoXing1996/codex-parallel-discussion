@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex Parallel Discussion"
+  short_description: "Discuss topics in interactive Codex forks inside tmux"
+  default_prompt: "Use $codex-parallel-discussion to open one interactive tmux fork per topic or message, then collect the discussion results."
