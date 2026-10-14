@@ -10,9 +10,11 @@ Prompts request short replies so the results fit in the panes.
 - `finish.cast` / `finish.gif`: type `/finish` in each fork, notify the source thread,
   and return to the parent pane as each discussion closes.
 
-The recordings contain actual terminal output, including startup and model latency.
-GIF playback is accelerated and long idle intervals are capped. The automated tests
-use a stand-in for Codex; these recordings do not.
+The recordings contain actual terminal output, including Codex startup and model
+latency. Shell setup and title-formatting commands are trimmed so each recording
+starts on the clean title screen. GIF playback is accelerated and long idle
+intervals are capped. The automated tests use a stand-in for Codex; these recordings
+do not.
 
 To record your own demonstration, use a fresh source thread without private context
 and a separate tmux server. For example, with [asciinema](https://asciinema.org/):
@@ -33,6 +35,8 @@ agg --font-size 13 --line-height 1.15 --theme github-dark \
   --speed 2 --fps-cap 10 --idle-time-limit 2 demo.cast demo.gif
 ```
 
-Inspect recordings before sharing: terminal output can include local paths,
+Inspect the first frame, transitions, and final frame before sharing. Prepare titles
+before recording, or trim the setup commands from the asciicast before rendering.
+Terminal output can include local paths,
 conversation text, and account details. Do not include the discussion state files or
 full result snapshots in a public recording repository.

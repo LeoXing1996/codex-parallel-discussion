@@ -18,11 +18,14 @@ authenticated **Codex CLI** with `codex exec fork --json` support. Verified with
 Codex CLI 0.162.1 and tmux 3.8. The Python runtime uses only the standard library;
 the npm package has no dependencies or install hooks.
 
-Install the skill directly from GitHub:
+Install with the [Skills CLI](https://github.com/vercel-labs/skills):
 
 ```bash
-npx --yes github:LeoXing1996/codex-parallel-discussion#v0.1.0 install-skill
+npx skills add LeoXing1996/codex-parallel-discussion --agent codex --global
 ```
+
+This installs the skill for your Codex sessions. Omit `--global` to install it only
+in the current project. The npm package name is `skills` (plural).
 
 Then, in a Codex session running inside tmux:
 
@@ -39,10 +42,12 @@ and keeps the group state for later collection and cleanup. In any idle fork, ty
 **`/finish`** to notify the main thread and close that pane. Start a new Codex session
 if the installed skill is not yet listed.
 
-This release is distributed through GitHub; it does **not** require an npm registry
-publication. Use the full `github:` specifier above, not the bare package name.
+The skill is installed directly from this GitHub repository; no separate npm
+publication of `codex-parallel-discussion` is required.
 
 ## Use the CLI directly
+
+For shell commands, the optional CLI runs through the GitHub package specifier:
 
 Create `topics.json`:
 
@@ -89,9 +94,11 @@ Use `open --help` for all options. `--items -` reads JSON from stdin. `--cwd` ch
 the shared workspace. `--tmux-socket` targets another server. Without `--state`,
 state lives under `$CODEX_HOME/parallel-discussions/<group-id>/state.json`.
 
-For an existing skill installation, add `--force` to back it up and replace it.
-`--dest <skills-directory>` chooses a different installation directory. Backups are
-stored in a sibling `skill-backups` directory, outside skill discovery.
+The optional `install-skill` CLI command is an alternative to `npx skills add`.
+For that command, `--force` backs up and replaces an existing installation, and
+`--dest <skills-directory>` selects another directory. Backups live in a sibling
+`skill-backups` directory, outside skill discovery. These options belong to this
+repository's CLI, not the Skills CLI.
 
 ## How it works
 
@@ -197,7 +204,8 @@ collection; partial failures; ownership checks; busy panes; layout restoration;
 completion notification failures; and `/finish` using a real terminal Enter event.
 
 The skill and Python helper live together under `skills/codex-parallel-discussion/`.
-The Node entrypoint provides `npx` distribution and skill installation without
-duplicating the runtime. See [demo notes](demo/README.md) for the recording workflow.
+The Skills CLI discovers this directory directly. The optional Node entrypoint
+provides shell commands without duplicating the runtime.
+See [demo notes](demo/README.md) for the recording workflow.
 
 MIT licensed. Independent community tool; not affiliated with OpenAI.
