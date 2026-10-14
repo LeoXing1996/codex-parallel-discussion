@@ -6,9 +6,11 @@ Explore several ideas at once, talk directly to each fork, then bring the conclu
 back together. Give it a list of topics or messages: N items become N independent
 conversations, tiled alongside your main session.
 
-![Three interactive Codex forks opening in tmux, replying to design questions, and closing back to the parent pane](https://raw.githubusercontent.com/LeoXing1996/codex-parallel-discussion/main/demo/demo.gif)
+![A natural-language Codex request opens three Todo CLI discussions; the parent collects their conclusions and closes the panes](https://raw.githubusercontent.com/LeoXing1996/codex-parallel-discussion/main/demo/demo.gif)
 
-Recorded with real Codex sessions in an isolated tmux server. Playback is accelerated.
+Start in the Codex input box, invoke the skill, follow up in a fork, then collect
+and close from the main conversation. Recorded with real Codex sessions in an
+isolated tmux server; waiting time is shortened.
 [Download the terminal recording](demo/demo.cast).
 
 ## Quick start
@@ -121,7 +123,12 @@ limits how many panes can be displayed. Each active fork uses your Codex account
 
 ### Finish a discussion asynchronously
 
-![Typing finish in each fork sends completion notices to the main thread and closes each pane](https://raw.githubusercontent.com/LeoXing1996/codex-parallel-discussion/main/demo/finish.gif)
+![Finishing one README review closes its pane and the notified parent updates the README while another review remains open](https://raw.githubusercontent.com/LeoXing1996/codex-parallel-discussion/main/demo/finish.gif)
+
+This separate demo starts with two reviews already open. The parent was asked to
+apply each completed review to the README. Typing `/finish` in the installation
+review triggers that work: the parent reads the saved result, adds the missing
+prerequisites, and shows the diff. The other review stays open.
 
 Once a fork has finished replying, type this directly in its Codex input box:
 
@@ -147,6 +154,10 @@ fork, but the parent may process the notification as a new turn. It is tested ag
 the 0.162.1 composer layout. If the notification fails, or the fork is visibly busy,
 the pane stays open. An uncertain delivery is not retried automatically: inspect the
 parent, then use `close` if the notice was already received.
+
+To have the parent continue work automatically, give it that instruction before
+finishing a fork, for example: "When a discussion finishes, read its saved result
+and update the relevant README section. Keep the other discussions open."
 
 ### What is preserved
 
