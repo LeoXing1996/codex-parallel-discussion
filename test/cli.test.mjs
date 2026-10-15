@@ -15,6 +15,10 @@ test('npx entrypoint supports help and forwards Python arguments and exit codes'
   assert.equal(help.status, 0, help.stderr);
   assert.match(help.stdout, /--source-thread/);
   assert.notEqual(run(['open', '--unknown']).status, 0);
+  assert.match(run(['preflight', '--help']).stdout, /--tmux-socket/);
+  const blocked = run(['preflight', '--source-thread', 'invalid', '--codex-bin', '/nonexistent/codex']);
+  assert.equal(blocked.status, 1, blocked.stderr);
+  assert.equal(JSON.parse(blocked.stdout).ready, false);
 });
 
 test('installer creates a self-contained skill and protects local changes', () => {

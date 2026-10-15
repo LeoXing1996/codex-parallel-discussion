@@ -40,7 +40,9 @@ Only discuss; do not edit code yet.
 ```
 
 The skill finds the current thread and verified parent pane, opens one fork per item,
-and keeps the group state for later collection and cleanup. In any idle fork, type
+names each fork after its topic, and keeps the group state for later collection and cleanup.
+The terminal title follows the selected pane's Codex title with ` | main` or
+` | Discussion-N` appended. In any idle fork, type
 **`/finish`** to notify the main thread and close that pane. Start a new Codex session
 if the installed skill is not yet listed.
 
@@ -87,7 +89,8 @@ npx --yes github:LeoXing1996/codex-parallel-discussion#v0.1.0 close --state /tmp
 | Command | What it does |
 | --- | --- |
 | `install-skill` | Copies the self-contained skill to `$CODEX_HOME/skills` or `~/.codex/skills` |
-| `open` | Creates N forks, sends their initial messages, and tiles their panes |
+| `preflight` | Reports startup blockers and repair hints as JSON without creating resources |
+| `open` | Checks prerequisites, creates and names N forks, sends their initial messages, and tiles their panes |
 | `status` | Returns current pane presence and terminal snapshots as JSON |
 | `collect` | Saves and returns snapshots in topic order for synthesis |
 | `close` | Saves final snapshots, closes owned panes, and restores the original layout when possible |
@@ -105,7 +108,8 @@ repository's CLI, not the Skills CLI.
 ## How it works
 
 1. `codex exec fork <source-id> --json` creates a persistent fork without a model turn.
-2. `codex resume <fork-id> <message>` opens its interactive TUI with the initial message.
+2. The app-server `thread/name/set` API assigns the topic as the fork's real Codex
+   name, then `codex resume <fork-id> <message>` opens its TUI with the initial message.
 3. tmux tiles the parent and discussion panes to fit the window.
 4. The parent collects visible discussion results and synthesizes them.
 
@@ -113,6 +117,9 @@ These are independent **forks**, not native Codex sub-agents. Each inherits the 
 history and accepts direct human input. `/finish` sends an explicit completion notice;
 ordinary replies do not automatically report back.
 The tool preserves Codex's model and permission settings and never edits its database.
+Naming uses an initialized stdio app-server connection without starting a model turn.
+Names collapse topic whitespace to one line. String items get the generated
+`Discussion N` name; use topic/message objects when you want descriptive names.
 See the [Codex CLI reference](https://learn.chatgpt.com/docs/cli/reference).
 
 With the default tmux bindings, use `Ctrl+B`, then an arrow to switch panes, and
@@ -120,6 +127,46 @@ With the default tmux bindings, use `Ctrl+B`, then an arrow to switch panes, and
 limits how many panes can be displayed. Each active fork uses your Codex account's resources.
 
 ## Boundaries and recovery
+
+### Diagnose startup once
+
+From a repository checkout, run the current helper before opening if the environment
+is missing session information:
+
+```bash
+node bin/cli.mjs preflight
+node bin/cli.mjs preflight --source-thread <uuid> --parent-pane %N --cwd <directory>
+```
+
+`preflight` and blocked `open` return JSON on stdout with `ready: false`, all detected
+`blockers`, and a repair `hint` for each; the exit code is 1. Successful preflight
+returns `ready: true` and resolved values. It checks the UUID format, pane presence,
+workspace, optional existing state path, Codex fork support, and tmux/socket access.
+It creates no forks, panes, state files, or settings. `open` always repeats the checks.
+This is a startup check, not proof of authentication or the source thread's existence.
+
+When the parent is missing, the report lists candidate panes and a capture command.
+Match the current conversation on screen before passing `--parent-pane`; even a
+single pane is not automatically selected. Use the current `CODEX_THREAD_ID` or an
+explicit, verified source UUID. Do not guess from the newest session, `--last`, or
+client PIDs: a shared Codex daemon can own the actual session.
+
+For socket errors, check the server and `--tmux-socket` path, then the host's allowed
+tmux access. The helper does not change sandbox permissions. Existing groups return
+their state paths for `status`/`collect`, so you can recover without duplicating forks.
+
+### Dynamic terminal titles
+
+The helper temporarily enables tmux `set-titles` and forwards the selected pane's
+live Codex title with its role appended: `Memory design | main` or
+`Claude memory | Discussion-1`. If Codex includes activity or project fields in its
+title, those remain visible. Switching panes or renaming a thread updates the title
+through Codex and tmux; the terminal must allow applications to set its title.
+
+These are session-local tmux settings. Multiple discussion groups in different
+windows share them, and closing the last group restores the previous settings.
+User changes made while discussions are open are preserved. No terminal or Codex
+configuration file is rewritten, and the main conversation's name is preserved.
 
 ### Finish a discussion asynchronously
 
@@ -213,6 +260,8 @@ Tests use real tmux on isolated sockets and a Codex stand-in, so they require no
 Codex login or model calls. They cover N = 1, 2, 5, and 8; literal message handling;
 collection; partial failures; ownership checks; busy panes; layout restoration;
 completion notification failures; and `/finish` using a real terminal Enter event.
+They also cover aggregated preflight failures, read-only diagnostics, topic-based
+thread naming, dynamic titles, and title restoration across multiple groups.
 
 The skill and Python helper live together under `skills/codex-parallel-discussion/`.
 The Skills CLI discovers this directory directly. The optional Node entrypoint

@@ -12,6 +12,7 @@ const usage = `Codex Parallel Discussion
 
 Usage:
   codex-parallel-discussion install-skill [--dest <skills-directory>] [--force]
+  codex-parallel-discussion preflight [--parent-pane %N] [options]
   codex-parallel-discussion open --items <topics.json> [--parent-pane %N] [options]
   codex-parallel-discussion status --state <state.json>
   codex-parallel-discussion collect --state <state.json> [--lines 120]

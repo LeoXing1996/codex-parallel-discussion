@@ -9,10 +9,12 @@ import json
 import os
 from pathlib import Path
 import re
+import select
 import shlex
 import shutil
 import subprocess
 import sys
+import time
 import uuid
 
 MARKER = "@codex_discussion_group"
@@ -21,6 +23,8 @@ BORDER = " #{pane_index} · #{@codex_discussion_label} "
 STATE = "@codex_discussion_state"
 ENTER = "@codex_discussion_enter_binding"
 ENTER_BEFORE = "@codex_discussion_enter_before"
+TITLES = "@codex_discussion_titles"
+TITLE_FORMAT = "#{pane_title}#{?" + LABEL + ", | #{" + LABEL + "},}"
 
 
 class DiscussionError(Exception):
@@ -57,7 +61,7 @@ class Tmux:
         if value is None:
             self.run("set-option", "-" + scope + "u", "-t", target, key)
         else:
-            self.run("set-option", "-" + scope, "-t", target, key, value)
+            self.run("set-option", *(["-" + scope] if scope else []), "-t", target, key, value)
 
     def panes(self, window):
         fields = ["pane_id", "pane_pid", "pane_width", "pane_height", "pane_dead", "pane_current_command"]
@@ -176,6 +180,108 @@ def uninstall_enter(tmux, parent):
     tmux.set_option("s", parent, ENTER_BEFORE, None)
 
 
+def install_titles(tmux, session):
+    # Session options are shared by groups in different windows of this session.
+    if tmux.option("", session, TITLES):
+        return
+    options = {key: {"before": tmux.option("", session, key), "applied": value}
+               for key, value in (("set-titles", "on"), ("set-titles-string", TITLE_FORMAT))}
+    tmux.set_option("", session, TITLES, json.dumps(options))
+    for key, values in options.items():
+        tmux.set_option("", session, key, values["applied"])
+
+
+def uninstall_titles(tmux, session):
+    if tmux.run("list-windows", "-t", session, "-F", "#{" + MARKER + "}").strip():
+        return
+    saved = tmux.option("", session, TITLES)
+    if saved:
+        for key, values in json.loads(saved).items():
+            if tmux.option("", session, key) == values["applied"]:
+                tmux.set_option("", session, key, values["before"])
+        tmux.set_option("", session, TITLES, None)
+
+
+def preflight(args):
+    """Read-only startup diagnostics; never infer a conversation's identity."""
+    report = {"ready": False, "resolved": {}, "blockers": [], "pane_candidates": []}
+    resolved = report["resolved"]
+
+    def block(check, message, hint):
+        report["blockers"].append({"check": check, "message": message, "hint": hint})
+
+    source = args.source_thread or os.environ.get("CODEX_THREAD_ID")
+    try:
+        resolved["source_thread"] = str(uuid.UUID(source or ""))
+    except ValueError:
+        block("source_thread", "Current source thread UUID is missing or invalid.",
+              "Supply the current CODEX_THREAD_ID or --source-thread <uuid> from this conversation. "
+              "Do not use --last, the newest session, or a PID/database guess.")
+    parent = args.parent_pane or os.environ.get("TMUX_PANE")
+    valid_parent = bool(parent and re.fullmatch(r"%\d+", parent))
+    if not valid_parent:
+        block("parent_pane", "Verified parent pane is missing or invalid.",
+              "Match the current conversation on a candidate's screen, then pass --parent-pane %N. "
+              "A sole or active pane is not proof of identity.")
+    else:
+        resolved["parent_pane"] = parent
+    cwd = Path(args.cwd).expanduser().resolve()
+    resolved["cwd"] = str(cwd)
+    if not cwd.is_dir():
+        block("cwd", "Working directory does not exist.", "Pass --cwd <existing-directory>.")
+    if args.state:
+        state = Path(args.state).expanduser().resolve()
+        resolved["state_file"] = str(state)
+        if state.exists():
+            block("state_file", "State file already exists.",
+                  "Use status/collect/close with this --state path, or choose a new path for a new group.")
+    codex = shutil.which(args.codex_bin)
+    if not codex:
+        block("codex", "Codex CLI was not found.", "Install Codex on PATH or pass --codex-bin <executable>.")
+    else:
+        resolved["codex_bin"] = str(Path(codex).resolve())
+        try:
+            help_text = execute([codex, "exec", "fork", "--help"])
+            if "--json" not in help_text or "fork" not in help_text:
+                raise DiscussionError("exec fork help does not advertise --json support.")
+        except DiscussionError as exc:
+            block("codex_fork", str(exc), "Use a Codex CLI supporting promptless exec fork --json.")
+    if not shutil.which("tmux"):
+        block("tmux", "tmux was not found on PATH.", "Install tmux and run Codex in a tmux pane.")
+    else:
+        tmux = Tmux(args.tmux_socket)
+        fields = ("pane_id", "session_id", "window_id", "pane_current_command", "pane_title")
+        try:
+            raw = tmux.run("list-panes", "-a", "-F", "\t".join("#{" + f + "}" for f in fields))
+            candidates = [dict(zip(fields, line.split("\t", len(fields) - 1))) for line in raw.splitlines()]
+        except DiscussionError as exc:
+            block("tmux_socket", str(exc),
+                  "Check the tmux server/socket (use --tmux-socket if needed). For permission denied or "
+                  "operation not permitted, use the host's allowed tmux access; do not change permissions automatically.")
+        else:
+            if not valid_parent or parent not in {p["pane_id"] for p in candidates}:
+                report["pane_candidates"] = candidates
+                report["capture_command"] = shlex.join(tmux.prefix + ["capture-pane", "-p", "-J", "-t", "%N", "-S", "-60"])
+                if valid_parent:
+                    block("parent_pane", "Parent pane is absent from this tmux server.",
+                          "Verify a candidate's screen or supply the correct --tmux-socket; do not reuse a stale ID.")
+            else:
+                try:
+                    keys = ("socket", "server_pid", "session", "window", "layout")
+                    values = tmux.info(parent, "#{socket_path}\t#{pid}\t#{session_id}\t#{window_id}\t#{window_layout}").split("\t", 4)
+                    resolved.update(zip(keys, values))
+                    group = tmux.option("w", resolved["window"], MARKER)
+                    if group:
+                        paths = tmux.run("list-panes", "-t", resolved["window"], "-F", "#{" + STATE + "}")
+                        resolved["existing_group"] = {"group_id": group, "state_files": sorted({p for p in paths.splitlines() if p})}
+                        block("existing_group", "This window already has a discussion group.",
+                              "Use status/collect with its state file; do not reopen the input list.")
+                except DiscussionError as exc:
+                    block("parent_pane", str(exc), "Recheck the parent pane and tmux access before opening.")
+    report["ready"] = not report["blockers"]
+    return report
+
+
 def busy(tmux, pane):
     footer = "\n".join(tmux.capture(pane, 0).splitlines()[-12:])
     return bool(re.search(r"esc\s+to\s+interrupt|按\s*esc\s*.*中断", footer, re.I))
@@ -215,6 +321,59 @@ def fork_thread(codex, source, cwd):
     raise DiscussionError("Codex did not return thread.started; check support for exec fork without a prompt.")
 
 
+def set_thread_name(codex, thread, name, cwd):
+    """Use the supported metadata API; no turn/start, TUI input, or database edits."""
+    try:
+        process = subprocess.Popen([codex, "app-server", "--listen", "stdio://"], cwd=cwd,
+                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    except OSError as exc:
+        raise DiscussionError("Cannot start Codex for thread naming: " + str(exc)) from exc
+    pending = b""
+
+    def send(message):
+        process.stdin.write((json.dumps(message, ensure_ascii=False) + "\n").encode())
+        process.stdin.flush()
+
+    def request(identifier, method, params):
+        nonlocal pending
+        send({"id": identifier, "method": method, "params": params})
+        deadline = time.monotonic() + 15
+        while True:
+            if b"\n" not in pending:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not select.select([process.stdout], [], [], remaining)[0]:
+                    raise DiscussionError("Timed out waiting for Codex " + method)
+                chunk = os.read(process.stdout.fileno(), 65536)
+                if not chunk:
+                    raise DiscussionError("Codex app-server closed before replying to " + method)
+                pending += chunk
+                continue
+            line, pending = pending.split(b"\n", 1)
+            response = json.loads(line)
+            if response.get("id") != identifier:
+                continue
+            if "error" in response:
+                raise DiscussionError(f"Codex {method}: {response['error']}")
+            return
+
+    try:
+        request(1, "initialize", {"clientInfo": {"name": "codex_parallel_discussion", "version": "0.1.0"}})
+        send({"method": "initialized"})
+        request(2, "thread/name/set", {"threadId": thread, "name": name})
+    except (OSError, ValueError) as exc:
+        raise DiscussionError("Cannot name the fork: " + str(exc)) from exc
+    finally:
+        process.stdin.close()
+        if process.poll() is None:
+            process.terminate()
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+        process.stdout.close()
+
+
 def initial_message(item):
     return (
         f"You are an independent discussion fork. Topic: {item['topic']}.\n"
@@ -227,26 +386,18 @@ def initial_message(item):
 
 
 def open_group(args):
-    items = items_from(args.items)
-    source = args.source_thread or os.environ.get("CODEX_THREAD_ID")
+    report = preflight(args)
     try:
-        source = str(uuid.UUID(source or ""))
-    except ValueError as exc:
-        raise DiscussionError("Provide an explicit --source-thread UUID or the current CODEX_THREAD_ID.") from exc
-    parent = args.parent_pane or os.environ.get("TMUX_PANE")
-    if not parent or not re.fullmatch(r"%\d+", parent):
-        raise DiscussionError("Provide a verified --parent-pane %N.")
-    codex = shutil.which(args.codex_bin)
-    if not codex:
-        raise DiscussionError("Codex CLI was not found on PATH.")
-    cwd = str(Path(args.cwd).resolve())
-    if not Path(cwd).is_dir():
-        raise DiscussionError("Working directory does not exist.")
-    tmux = Tmux(args.tmux_socket)
-    socket, server_pid, window, layout = tmux.info(parent, "#{socket_path}\t#{pid}\t#{window_id}\t#{window_layout}").split("\t", 3)
+        items = items_from(args.items)
+    except DiscussionError as exc:
+        report["blockers"].append({"check": "items", "message": str(exc), "hint": "Supply a nonempty JSON list of topics/messages."})
+        report["ready"] = False
+    if not report["ready"]:
+        return report
+    resolved = report["resolved"]
+    source, parent, codex, cwd = (resolved[k] for k in ("source_thread", "parent_pane", "codex_bin", "cwd"))
+    socket, server_pid, window, layout = (resolved[k] for k in ("socket", "server_pid", "window", "layout"))
     tmux = Tmux(socket)
-    if tmux.option("w", window, MARKER):
-        raise DiscussionError("This window already has a discussion group; manage it before opening another.")
     group_id = str(uuid.uuid4())
     root = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
     path = Path(args.state).expanduser().resolve() if args.state else root / "parallel-discussions" / group_id / "state.json"
@@ -259,6 +410,7 @@ def open_group(args):
             "source_thread": source, "codex_bin": codex, "cwd": cwd, "original_panes": list(tmux.panes(window)),
             "original_layout": layout, "options": {}, "items": items,
             "parent_label": tmux.option("p", parent, LABEL),
+            "parent_label_applied": "main", "session": resolved["session"],
         }
         for key, applied in (("pane-border-status", "top"), ("pane-border-format", BORDER)):
             state["options"][key] = {"before": tmux.option("w", window, key), "applied": applied}
@@ -266,11 +418,16 @@ def open_group(args):
         try:
             tmux.set_option("w", window, MARKER, group_id)
             install_enter(tmux, parent)
-            tmux.set_option("p", parent, LABEL, "Main conversation")
+            install_titles(tmux, state["session"])
+            tmux.set_option("p", parent, LABEL, state["parent_label_applied"])
             for key, values in state["options"].items():
                 tmux.set_option("w", window, key, values["applied"])
             for item in items:
                 item["thread_id"] = fork_thread(codex, source, cwd)
+                save(path, state)
+                name = " ".join(item["topic"].split())
+                set_thread_name(codex, item["thread_id"], name, cwd)
+                item["thread_name"] = name
                 save(path, state)
                 panes = tmux.panes(window)
                 targets = [p for p in panes.values() if p["pane_id"] == parent or tmux.option("p", p["pane_id"], MARKER) == group_id]
@@ -282,7 +439,7 @@ def open_group(args):
                 save(path, state)
                 tmux.set_option("p", item["pane"], MARKER, group_id)
                 tmux.set_option("p", item["pane"], STATE, str(path))
-                tmux.set_option("p", item["pane"], LABEL, f"Discussion {item['index']}")
+                tmux.set_option("p", item["pane"], LABEL, f"Discussion-{item['index']}")
                 tmux.run("select-layout", "-t", window, "tiled")
                 print(f"Created {item['index']}/{len(items)}: {item['topic']} ({item['pane']})", file=sys.stderr)
             state["status"] = "open"
@@ -339,10 +496,12 @@ def restore_group(tmux, state):
     for key, values in state["options"].items():
         if tmux.option("w", state["window"], key) == values["applied"]:
             tmux.set_option("w", state["window"], key, values["before"])
-    if tmux.option("p", state["parent_pane"], LABEL) == "Main conversation":
+    if tmux.option("p", state["parent_pane"], LABEL) == state.get("parent_label_applied", "Main conversation"):
         tmux.set_option("p", state["parent_pane"], LABEL, state["parent_label"])
     tmux.set_option("w", state["window"], MARKER, None)
     uninstall_enter(tmux, state["parent_pane"])
+    if state.get("session"):
+        uninstall_titles(tmux, state["session"])
     state["status"] = "closed"
 
 
@@ -423,14 +582,17 @@ def main():
             return 1
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
-    opening = commands.add_parser("open", help="One list item creates one interactive fork")
-    opening.add_argument("--items", required=True, help="JSON file, or - for stdin")
-    opening.add_argument("--parent-pane")
-    opening.add_argument("--source-thread")
-    opening.add_argument("--cwd", default=os.getcwd())
-    opening.add_argument("--state")
-    opening.add_argument("--tmux-socket")
-    opening.add_argument("--codex-bin", default="codex")
+    for name, help_text in (("preflight", "Read-only startup checks; no forks or pane changes"),
+                            ("open", "One list item creates one interactive fork")):
+        opening = commands.add_parser(name, help=help_text)
+        if name == "open":
+            opening.add_argument("--items", required=True, help="JSON file, or - for stdin")
+        opening.add_argument("--parent-pane")
+        opening.add_argument("--source-thread")
+        opening.add_argument("--cwd", default=os.getcwd())
+        opening.add_argument("--state")
+        opening.add_argument("--tmux-socket")
+        opening.add_argument("--codex-bin", default="codex")
     for name in ("status", "collect", "close"):
         command = commands.add_parser(name)
         command.add_argument("--state", required=True)
@@ -440,8 +602,11 @@ def main():
     if hasattr(args, "lines") and not 0 <= args.lines <= 2000:
         parser.error("--lines must be between 0 and 2000")
     try:
-        action = {"open": open_group, "close": close_group}.get(args.command, inspect_group)
-        print(json.dumps(action(args), ensure_ascii=False, indent=2))
+        action = {"preflight": preflight, "open": open_group, "close": close_group}.get(args.command, inspect_group)
+        result = action(args)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        if result.get("ready") is False:
+            return 1
     except DiscussionError as exc:
         print(json.dumps({"error": str(exc)}, ensure_ascii=False), file=sys.stderr)
         return 1

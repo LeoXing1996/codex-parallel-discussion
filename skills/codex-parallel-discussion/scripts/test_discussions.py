@@ -2,6 +2,7 @@
 """Focused end-to-end checks using real tmux and an isolated Codex stand-in."""
 
 import json
+import argparse
 import os
 from pathlib import Path
 import pty
@@ -11,12 +12,18 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 import uuid
+
+import discussions
 
 SCRIPT = Path(__file__).with_name("discussions.py")
 STUB = '''#!/usr/bin/env python3
 import json, signal, sys, uuid
 from pathlib import Path
+if sys.argv[1:] == ["exec", "fork", "--help"]:
+    print("Usage: codex exec fork [OPTIONS] <SESSION_ID> [PROMPT] --json")
+    sys.exit(0)
 log = Path(LOG_PATH)
 with log.open("a") as f:
     f.write(json.dumps(sys.argv[1:], ensure_ascii=False) + "\\n")
@@ -27,6 +34,19 @@ if sys.argv[1:3] == ["exec", "fork"]:
         print("planned fork failure", file=sys.stderr)
         sys.exit(2)
     print(json.dumps({"type": "thread.started", "thread_id": str(uuid.uuid4())}))
+elif sys.argv[1] == "app-server":
+    for line in sys.stdin:
+        request = json.loads(line)
+        with log.open("a") as f:
+            f.write(json.dumps(["rpc", request], ensure_ascii=False) + "\\n")
+        if request["method"] == "thread/name/set" and "RENAME_FAIL" in request["params"]["name"]:
+            response = {"id": request["id"], "error": {"message": "planned rename failure"}}
+        elif "id" in request:
+            response = {"id": request["id"], "result": {}}
+        else:
+            continue
+        print(json.dumps({"method": "fixture/notification"}), flush=True)
+        print(json.dumps(response), flush=True)
 elif sys.argv[1] == "resume":
     print("Codex fixture", flush=True)
     print(sys.argv[-1], flush=True)
@@ -43,6 +63,26 @@ elif sys.argv[1] == "queue":
 else:
     sys.exit(2)
 '''
+
+
+class PreflightTest(unittest.TestCase):
+    def args(self, **overrides):
+        return argparse.Namespace(**dict(dict(source_thread=None, parent_pane=None, cwd=os.getcwd(),
+                                              state=None, codex_bin="codex", tmux_socket=None), **overrides))
+
+    def test_missing_identity_and_dependencies_are_reported_together(self):
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch("discussions.shutil.which", return_value=None):
+            result = discussions.preflight(self.args())
+        self.assertFalse(result["ready"])
+        self.assertEqual({b["check"] for b in result["blockers"]}, {"source_thread", "parent_pane", "codex", "tmux"})
+
+    def test_socket_permission_failure_is_actionable_without_retry_or_mutation(self):
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch("discussions.shutil.which", return_value="/bin/tool"), \
+                mock.patch("discussions.execute", side_effect=["exec fork --json", discussions.DiscussionError("Operation not permitted")]) as run:
+            result = discussions.preflight(self.args())
+        self.assertEqual({b["check"] for b in result["blockers"]}, {"source_thread", "parent_pane", "tmux_socket"})
+        self.assertIn("allowed tmux access", result["blockers"][-1]["hint"])
+        self.assertEqual([c.args[0][1] for c in run.call_args_list], ["exec", "list-panes"])
 
 
 class DiscussionTest(unittest.TestCase):
@@ -66,13 +106,15 @@ class DiscussionTest(unittest.TestCase):
     def tmux(self, *args):
         return subprocess.check_output(["tmux", "-S", self.socket, *args], text=True).strip()
 
-    def call(self, command, *extra, items=None, ok=True):
+    def call(self, command, *extra, items=None, ok=True, env=None):
         args = [sys.executable, "-B", str(SCRIPT), command, "--state", str(self.state)]
-        if command == "open":
-            args += ["--items", "-", "--parent-pane", self.parent, "--source-thread", str(uuid.UUID(int=1)), "--cwd", str(self.root), "--tmux-socket", self.socket, "--codex-bin", str(self.codex)]
-        result = subprocess.run(args + list(extra), input=json.dumps(items, ensure_ascii=False) if items is not None else None, text=True, capture_output=True, timeout=30)
+        if command in ("open", "preflight"):
+            args += ["--parent-pane", self.parent, "--source-thread", str(uuid.UUID(int=1)), "--cwd", str(self.root), "--tmux-socket", self.socket, "--codex-bin", str(self.codex)]
+            if command == "open":
+                args += ["--items", "-"]
+        result = subprocess.run(args + list(extra), input=json.dumps(items, ensure_ascii=False) if items is not None else None, text=True, capture_output=True, timeout=30, env=env)
         if ok:
-            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
             return json.loads(result.stdout)
         self.assertNotEqual(result.returncode, 0, result.stdout)
         return result
@@ -88,6 +130,103 @@ class DiscussionTest(unittest.TestCase):
                 return resumes
             time.sleep(0.05)
         self.fail("initial messages were not received")
+
+    def test_preflight_is_read_only_and_explicit_arguments_override_environment(self):
+        before = self.tmux("show-options", "-t", self.parent)
+        result = self.call("preflight", env=dict(os.environ, CODEX_THREAD_ID="invalid", TMUX_PANE="%9999"))
+        self.assertTrue(result["ready"])
+        self.assertEqual(result["resolved"]["source_thread"], str(uuid.UUID(int=1)))
+        self.assertEqual(result["resolved"]["parent_pane"], self.parent)
+        self.assertEqual(self.panes(), [self.parent])
+        self.assertEqual(self.tmux("show-options", "-t", self.parent), before)
+        self.assertFalse(self.state.exists())
+        self.assertFalse(self.state.with_suffix(".lock").exists())
+        self.assertFalse(self.log.exists(), "preflight must not fork, resume, or queue")
+
+    def test_preflight_uses_current_environment_identity(self):
+        result = self.call("preflight", "--source-thread", "", "--parent-pane", "",
+                           env=dict(os.environ, CODEX_THREAD_ID=str(uuid.UUID(int=2)), TMUX_PANE=self.parent))
+        self.assertEqual(result["resolved"]["source_thread"], str(uuid.UUID(int=2)))
+        self.assertEqual(result["resolved"]["parent_pane"], self.parent)
+
+    def test_open_reports_all_blockers_and_candidates_without_creating_resources(self):
+        result = self.call("open", "--source-thread", "invalid", "--parent-pane", "%9999",
+                           "--cwd", str(self.root / "missing"), items=[], ok=False)
+        report = json.loads(result.stdout)
+        self.assertEqual({b["check"] for b in report["blockers"]}, {"source_thread", "parent_pane", "cwd", "items"})
+        self.assertEqual([p["pane_id"] for p in report["pane_candidates"]], [self.parent])
+        self.assertIn("capture-pane", report["capture_command"])
+        self.assertEqual(self.panes(), [self.parent])
+        self.assertFalse(self.state.exists())
+        self.assertFalse(self.log.exists())
+
+    def test_preflight_rejects_unsupported_codex_and_unreachable_socket(self):
+        self.codex.write_text("#!/bin/sh\nprintf 'unsupported command' >&2\nexit 2\n")
+        result = self.call("preflight", "--tmux-socket", str(self.root / "missing.sock"), ok=False)
+        self.assertEqual({b["check"] for b in json.loads(result.stdout)["blockers"]}, {"codex_fork", "tmux_socket"})
+
+    def test_preflight_reports_existing_group_and_state_for_recovery(self):
+        self.state = self.root / "state with spaces.json"
+        self.call("open", items=["one"])
+        result = json.loads(self.call("preflight", ok=False).stdout)
+        self.assertEqual({b["check"] for b in result["blockers"]}, {"existing_group", "state_file"})
+        self.assertEqual(result["resolved"]["existing_group"]["state_files"], [str(self.state)])
+        self.assertEqual(len(self.panes()), 2)
+
+    def test_terminal_title_follows_selected_pane_and_codex_title_then_restores(self):
+        before = self.tmux("show-options", "-t", self.parent)
+        result = self.call("open", items=["one"])
+        self.ready(1)
+        pane = result["items"][0]["pane"]
+        self.assertEqual(self.tmux("show-options", "-v", "-t", self.parent, "set-titles"), "on")
+        title = self.tmux("show-options", "-v", "-t", self.parent, "set-titles-string")
+        for target, name, role in ((self.parent, "Memory design", "main"), (pane, "Claude research", "Discussion-1"),
+                                   (pane, "Renamed discussion", "Discussion-1")):
+            self.tmux("select-pane", "-t", target, "-T", name)
+            self.tmux("select-pane", "-t", target)
+            self.assertEqual(self.tmux("display-message", "-p", "-t", self.window, title), name + " | " + role)
+        self.call("close")
+        self.assertEqual(self.tmux("show-options", "-t", self.parent), before)
+
+    def test_titles_restore_after_last_group_and_preserve_user_changes(self):
+        self.tmux("set-option", "-t", self.parent, "set-titles", "off")
+        self.tmux("set-option", "-t", self.parent, "set-titles-string", "original title")
+        self.call("open", items=["one"])
+        self.ready(1)
+        first_state = self.state
+        other = self.tmux("new-window", "-d", "-t", "isolated", "-P", "-F", "#{pane_id}", "sleep 3600")
+        self.state = self.root / "second.json"
+        self.call("open", "--parent-pane", other, items=["two"])
+        self.ready(2)
+        self.call("close", "--state", str(first_state))
+        self.assertEqual(self.tmux("show-options", "-v", "-t", other, "set-titles"), "on")
+        self.tmux("set-option", "-t", other, "set-titles-string", "user changed title")
+        self.call("close")
+        self.assertEqual(self.tmux("show-options", "-v", "-t", other, "set-titles"), "off")
+        self.assertEqual(self.tmux("show-options", "-v", "-t", other, "set-titles-string"), "user changed title")
+        self.assertEqual(self.tmux("show-options", "-qv", "-t", other, discussions.TITLES), "")
+
+    def test_forks_are_named_through_metadata_api_before_resume(self):
+        topic = 'Memory "隔离" `literal` $(literal)'
+        result = self.call("open", items=[{"topic": topic, "message": "Discuss only"}])
+        self.ready(1)
+        item = result["items"][0]
+        self.assertEqual(item["thread_name"], topic)
+        calls = [json.loads(x) for x in self.log.read_text().splitlines()]
+        requests = [c[1] for c in calls if c[0] == "rpc"]
+        self.assertEqual([r["method"] for r in requests], ["initialize", "initialized", "thread/name/set"])
+        self.assertEqual(requests[-1]["params"], {"threadId": item["thread_id"], "name": topic})
+        self.assertLess(next(i for i, c in enumerate(calls) if c[0] == "rpc" and c[1]["method"] == "thread/name/set"),
+                        next(i for i, c in enumerate(calls) if c[0] == "resume"))
+
+    def test_rename_failure_preserves_fork_id_for_recovery_without_opening_pane(self):
+        self.call("open", items=[{"topic": "RENAME_FAIL", "message": "one"}, "two"], ok=False)
+        state = json.loads(self.state.read_text())
+        self.assertEqual(state["status"], "partial")
+        self.assertTrue(state["items"][0]["thread_id"])
+        self.assertNotIn("thread_id", state["items"][1])
+        self.assertEqual(self.panes(), [self.parent])
+        self.call("close")
 
     def test_variable_counts_message_integrity_collect_close(self):
         for count in (1, 2, 5, 8):

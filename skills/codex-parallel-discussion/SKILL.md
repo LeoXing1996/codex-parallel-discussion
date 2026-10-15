@@ -19,8 +19,9 @@ asking each fork to acknowledge readiness and wait.
 - Discussion is the default; do not edit repository files until asked.
   Forks share a working directory. Use separate worktrees if implementation needs isolation.
 - The helper uses `codex exec fork --json` to obtain actual thread IDs, then
-  `codex resume <id> <message>` to launch each TUI. It preserves model and permission
-  settings and does not edit the Codex database.
+  names each fork after its topic through the app-server `thread/name/set` API,
+  and uses `codex resume <id> <message>` to launch each TUI. Naming does not start
+  a model turn. It preserves model and permission settings and does not edit the Codex database.
 - Read panes with `tmux capture-pane`, not an interactive `tmux attach` in tool logs.
 
 ## Open a group
@@ -40,10 +41,29 @@ Write a nonempty JSON array. Each item is a message string or an object containi
 ]
 ```
 
-1. Verify the parent pane. Use a reliable `TMUX_PANE`, or list panes and match the
-   current conversation on screen. Do not guess from the active window or reuse an old ID.
-2. Use the current `CODEX_THREAD_ID` as the source; never use `--last`.
-3. Run the helper from this skill's directory:
+1. Run the read-only startup check from this skill's directory:
+
+   ```bash
+   python3 scripts/discussions.py preflight
+   ```
+
+   It returns JSON with `ready`, `resolved`, and all detectable `blockers` with
+   repair hints. Exit code 1 means blocked. It checks the source UUID, parent pane,
+   workspace, optional state path, Codex fork CLI support, and tmux/socket access
+   without creating forks, files, panes, or changing settings. `open` runs the same
+   checks automatically; a separate check is useful when environment information is missing.
+2. Resolve the reported blockers together. Use the current `CODEX_THREAD_ID`, or
+   pass `--source-thread <uuid>` from a reliable current-session source. If that
+   identity is unavailable, request the exact ID; never use `--last`, scan newest
+   sessions, or walk client PIDs looking for a history file. Codex may use a shared daemon.
+3. Use a reliable `TMUX_PANE`, or inspect the returned `pane_candidates` with the
+   `capture_command` (replace `%N`) and match the current conversation on screen.
+   Pass the verified `--parent-pane %N`; a sole or active pane is not sufficient.
+   Socket failures include access hints. Use the host's supported permission flow
+   if access is blocked; do not widen permissions or change configuration automatically.
+   `--tmux-socket <path>` selects a non-default server. If a group already exists,
+   inspect its returned state path instead of reopening the list.
+4. Open the group with the resolved parameters:
 
 ```bash
 python3 scripts/discussions.py open --items /tmp/topics.json --parent-pane %1
@@ -57,6 +77,15 @@ Save the returned `state_file`. The default is
 `${CODEX_HOME:-~/.codex}/parallel-discussions/<group-id>/state.json`.
 The helper preserves existing panes and tiles the window dynamically. With the
 default tmux prefix, press `Ctrl+B`, then `Z` to zoom the selected pane.
+
+Each fork's actual Codex name is its topic, with whitespace collapsed to one line.
+String items use their generated `Discussion N` topic; use topic/message objects
+for descriptive names. The terminal title follows the selected pane's live Codex
+title, with ` | main` or ` | Discussion-N` appended. Codex's configured activity
+and project-name fields remain visible. The helper temporarily enables tmux title
+forwarding for that session; it does not overwrite the main thread's name or edit
+Codex/terminal configuration. The last group in a tmux session restores the prior
+title options, preserving any settings the user changed in the meantime.
 
 Run `status` after opening. Check that each fork received its message and is not
 stuck on an error or approval prompt. Creation does not mean the reply is complete.
